@@ -28,7 +28,11 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$VERSION" || { echo "Tag $TAG tidak cocok dengan versi package.json"; exit 1; }
           npm test
           zip -r "elephant-agent-$TAG.zip" bin src package.json README.md LICENSE
-          gh release create "$TAG" "elephant-agent-$TAG.zip" --title "Elephant Agent $TAG" --notes-file RELEASE_NOTES.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG sudah ada, dilewati"
+          else
+            gh release create "$TAG" "elephant-agent-$TAG.zip" --title "Elephant Agent $TAG" --notes-file RELEASE_NOTES.md
+          fi
 
       # Kode yang sama dipublish ke dua nama: scoped dulu (pasti milik sendiri), lalu unscoped.
       # Perlu secret NPM_TOKEN (granular access token dengan izin publish).

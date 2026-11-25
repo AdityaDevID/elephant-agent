@@ -68,4 +68,4 @@ v0.1.0: tampilan + setup provider/model + chat streaming. Belum ada tool-use (ba
 
 ## Lisensi
 
-[MIT](LICENSE) © 2026 AdityaDevID. Repo: <https://github.com/adityadevid/elephant-agent>
+[MIT](LICENSE) © 2026 AdityaDevID. Repo: <https://github.com/AdityaDevID/elephant-agent>

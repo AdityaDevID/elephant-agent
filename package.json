@@ -1,0 +1,46 @@
+{
+  "name": "elephant-agent",
+  "version": "0.1.0",
+  "description": "Agent AI berbasis terminal (TUI): multi-provider, tanpa dependency. Windows, Linux, Termux, ElephantPanel.",
+  "license": "MIT",
+  "author": "AdityaDevID",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adityadevid/elephant-agent.git"
+  },
+  "homepage": "https://github.com/adityadevid/elephant-agent#readme",
+  "bugs": {
+    "url": "https://github.com/adityadevid/elephant-agent/issues"
+  },
+  "bin": {
+    "elephant": "bin/elephant.js",
+    "elephant-agent": "bin/elephant.js"
+  },
+  "main": "src/ui.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/elephant.js",
+    "test": "node test/smoke.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "tui",
+    "terminal",
+    "cli",
+    "claude",
+    "openai",
+    "gemini",
+    "groq",
+    "openrouter",
+    "termux"
+  ]
+}

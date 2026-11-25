@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag rilis (harus cocok dengan version di package.json)
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+  id-token: write # provenance npm
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test, zip, dan GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          VERSION="${TAG#v}"
+          test "$(node -p "require('./package.json').version")" = "$VERSION" || { echo "Tag $TAG tidak cocok dengan versi package.json"; exit 1; }
+          npm test
+          zip -r "elephant-agent-$TAG.zip" bin src package.json README.md LICENSE
+          gh release create "$TAG" "elephant-agent-$TAG.zip" --title "Elephant Agent $TAG" --notes-file RELEASE_NOTES.md
+
+      # Kode yang sama dipublish ke dua nama: scoped dulu (pasti milik sendiri), lalu unscoped.
+      # Perlu secret NPM_TOKEN (granular access token dengan izin publish).
+      - name: Publish ke npm (@adityadevid/elephant-agent dan elephant-agent)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          test -n "$NPM_TOKEN" || { echo "Secret NPM_TOKEN belum diisi"; exit 1; }
+          npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          npm pkg set name=@adityadevid/elephant-agent
+          npm publish --access public --provenance
+          npm pkg set name=elephant-agent
+          npm publish --access public --provenance

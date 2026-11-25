@@ -42,7 +42,7 @@ Agent bisa bertindak di komputer/HP kamu. Contoh: *"jalankan npm test lalu perba
 | `edit_file` | ganti teks di file (harus unik, atau `replace_all`) | tanya |
 | `list_dir` | daftar isi folder | otomatis |
 | `search` | cari isi file dengan regex (seperti `grep -rn`) | otomatis |
-| `fetch_url` | ambil halaman web / API (GET) | tanya |
+| `fetch_url` | ambil halaman web / API (GET), dengan pagar SSRF (lihat di bawah) | tanya |
 
 **Mode izin** (`/mode`, tersimpan di config):
 
@@ -52,11 +52,25 @@ Agent bisa bertindak di komputer/HP kamu. Contoh: *"jalankan npm test lalu perba
 
 Perintah yang berbahaya (`rm -rf /`, `mkfs`, `curl ... | sh`, `shutdown`, dst.) **selalu** ditanya, bahkan di mode `auto`. Ini jaring pengaman sederhana, bukan sandbox: Agent berjalan dengan hak akses akun kamu, jadi baca perintahnya sebelum menekan `y`.
 
+**Pagar `fetch_url` (SSRF).** Agent tidak bisa membuka alamat internal lewat `fetch_url`: `localhost`, `127.x`, `10.x`, `172.16-31.x`, `192.168.x`, `100.64.x` (CGNAT/Tailscale), IPv6 loopback/ULA, dan bentuk yang disamarkan (`2130706433`, `0x7f.1`, `::ffff:127.0.0.1`, dst.). Pengecekan dilakukan saat koneksi dibuat (hasil DNS yang diperiksa = yang dipakai, jadi tahan DNS rebinding) dan diulang di setiap redirect. Kalau memang perlu (mis. Ollama lokal atau server di LAN), Agent akan bertanya dulu, per host:port dan hanya untuk satu panggilan; ini tetap ditanya di mode `auto`. Alamat metadata/link-local (`169.254.x.x`, `fe80::`, `metadata.google.internal`) tidak pernah diizinkan. Ini hanya melindungi `fetch_url`: `run_command` tetap bisa menjalankan `curl` ke mana saja kalau kamu menyetujuinya.
+
 Esc / Ctrl+C menghentikan jawaban dan proses yang sedang jalan. Satu pesan dibatasi 30 langkah tool. Perintah jalan tanpa stdin (tidak bisa interaktif) dan di folder kerja (`/cwd` untuk melihat atau mengganti). Tidak semua model mendukung tool; kalau error, coba model lain atau `/tools off`.
+
+## Konteks, token, dan retry
+
+**Auto-compact.** Sebelum tiap request, Agent memperkirakan isi konteks. Kalau sudah lewat 75% jendela model: (1) hasil tool lama dipotong dulu (mis. isi file besar yang sudah dibaca), (2) kalau masih kurang, percakapan lama diringkas oleh model jadi satu pesan ringkasan dan pesan lama disembunyikan; pesan terbaru tetap utuh. Kalau peringkasan gagal dan konteks hampir penuh, pesan lama dibuang dengan penanda supaya request tidak ditolak. Kalau server menjawab "konteks terlalu besar", Agent meringkas paksa lalu mengulang sekali. Ambang bisa diubah lewat `compactAt` (0.3 sampai 0.95) di config.
+
+**Ukuran jendela** ditebak dari nama model (Claude 200k, Gemini 1M, Llama 3.1+ 128k, dst., default 32k). Kalau tebakannya salah atau provider gratismu punya batas lebih kecil, atur sendiri: `/window 16k`, `/window auto` untuk kembali.
+
+- `/compact [fokus]`: ringkas sekarang, mis. `/compact nama file dan error yang sudah diperbaiki`
+- `/usage`: isi konteks (persen dari jendela), token masuk/keluar sesi ini, jumlah compact dan retry. Angka asli dari server kalau ada, tanda `~` kalau estimasi
+- Bar status menampilkan `ctx N%`
+
+**Retry.** Error sementara (429, 500/502/503/504/520-524/529, koneksi putus) diulang otomatis sampai 4 kali. Header `retry-after`, `retry-after-ms`, petunjuk di isi error ("try again in 7s", `retryDelay` Gemini) dihormati; kalau tidak ada, jeda naik eksponensial dengan jitter. Hitung mundurnya tampil di bawah kotak input. Tidak diulang: key salah (401/403), request salah (400), kuota atau saldo habis, atau server minta menunggu lebih dari 60 detik (limit harian): langsung dikasih tahu. Kalau jawaban sudah mulai tampil lalu putus, tidak diulang (supaya teks tidak dobel).
 
 ## Perintah di chat
 
-`/help` `/provider` `/model` `/key` `/system <teks>` `/tools [on|off]` `/mode [ask|auto|readonly]` `/cwd [folder]` `/clear` `/exit`
+`/help` `/provider` `/model` `/key` `/system <teks>` `/tools [on|off]` `/mode [ask|auto|readonly]` `/cwd [folder]` `/compact [fokus]` `/usage` `/window [angka|auto]` `/clear` `/exit`
 
 | Tombol | Fungsi |
 | --- | --- |
@@ -81,16 +95,20 @@ bin/elephant.js   entry point (CLI flags)
 src/ui.js         TUI: layar provider, form key, pilih model, chat, loop agent
 src/tools.js      tool-use: run_command, file, search, fetch_url + aturan izin
 src/providers.js  daftar provider + deteksi key
-src/api.js        list model & streaming + tool call (Anthropic + OpenAI-compatible)
+src/api.js        list model, streaming + tool call, retry/backoff, usage (Anthropic + OpenAI-compatible)
+src/context.js    estimasi token, pangkas hasil tool, ringkas percakapan lama
+src/safefetch.js  HTTP GET dengan pagar SSRF (klasifikasi IP, lookup terjaga, redirect dicek ulang)
 src/config.js     simpan config
 src/logo.js       logo
 test/smoke.js     tes API vs server mock
-test/tools.js     tes tool, izin, dan loop agent: npm test
+test/tools.js     tes tool, izin, dan loop agent
+test/context.js   tes konteks, retry, usage, auto-compact
+test/safefetch.js tes pagar SSRF (semua tes: npm test)
 ```
 
 ## Status
 
-v0.2.0: tool-use (jalankan perintah, baca/tulis/edit file, cari, fetch URL) dengan mode izin. v0.1.0: tampilan + setup provider/model + chat streaming.
+v0.3.0: auto-compact + `/compact` `/usage` `/window`, retry/backoff untuk rate limit, pagar SSRF di `fetch_url`. v0.2.0: tool-use (jalankan perintah, baca/tulis/edit file, cari, fetch URL) dengan mode izin. v0.1.0: tampilan + setup provider/model + chat streaming.
 
 ## Lisensi
 

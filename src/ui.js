@@ -7,6 +7,7 @@ const store = require('./config');
 const api = require('./api');
 const logo = require('./logo');
 const tools = require('./tools');
+const context = require('./context');
 const pkg = require('../package.json');
 
 const MAX_STEPS = 30; // batas langkah tool per pesan, supaya agent tidak berputar tanpa henti
@@ -37,6 +38,9 @@ const COMMANDS = [
   ['/tools', 'tool on/off (jalankan perintah, baca/tulis file)'],
   ['/mode', 'izin tool: ask | auto | readonly'],
   ['/cwd', 'lihat / ganti folder kerja'],
+  ['/compact', 'ringkas percakapan lama (opsional: /compact fokus)'],
+  ['/usage', 'token terpakai & isi konteks'],
+  ['/window', 'ukuran jendela konteks (/window 32k | auto)'],
   ['/clear', 'bersihkan percakapan'],
   ['/exit', 'keluar'],
 ];
@@ -220,6 +224,11 @@ class App {
     this.cwd = process.cwd();
     this.sessionAllow = new Set(); // tool yang diizinkan "selalu" selama sesi ini
     this.perm = null; // permintaan izin yang sedang menunggu jawaban
+    this.usage = { input: 0, output: 0, requests: 0, estRequests: 0, last: null, compactions: 0, pruned: 0, retries: 0 };
+    this.calib = 1; // koreksi estimasi token berdasarkan usage asli dari server
+    this.retryInfo = null; // {until, attempt, max, status} saat menunggu retry
+    this.compacting = false;
+    this._sysTok = null;
     if (!tools.MODES.includes(this.cfg.mode)) this.cfg.mode = 'ask';
   }
 
@@ -637,7 +646,10 @@ class App {
     const model = this.cfg.active ? this.cfg.active.model : '';
     for (let i = 0; i < this.messages.length; i++) {
       const m = this.messages[i];
-      if (m.role === 'user') {
+      if (m.archived) continue; // sudah diringkas: tidak ditampilkan lagi
+      if (m.summary) {
+        out.push(' ' + T.mute(`${G.bullet} ${m.covered} pesan lama diringkas untuk menghemat konteks`));
+      } else if (m.role === 'user') {
         out.push(' ' + A.bold(T.blue('Kamu')));
         for (const l of m.content.split('\n')) out.push(...A.wrapText(l, W - 2, '  '));
       } else if (m.role === 'assistant') {
@@ -705,8 +717,8 @@ class App {
     let boxLines = this.box(W, inner, this.busy ? T.faint : T.accent);
     if (this.perm) {
       const pm = this.perm;
-      const what = tools.describe(pm.tm.name, pm.tm.args).split('\n')[0].replace(/[\x00-\x1f\x7f]/g, ' ');
-      const lead = (pm.danger ? T.err('PERINGATAN: perintah berbahaya. ') : '') + T.warn('Izinkan ') + A.bold(pm.tm.name) + T.warn('? ');
+      const what = (pm.label || tools.describe(pm.tm.name, pm.tm.args)).split('\n')[0].replace(/[\x00-\x1f\x7f]/g, ' ');
+      const lead = (pm.danger ? T.err('PERINGATAN: ' + (pm.warn || 'perintah berbahaya') + '. ') : '') + T.warn('Izinkan ') + A.bold(pm.tm.name) + T.warn('? ');
       boxLines = this.box(W, A.truncate(lead + T.mute(what), iw), pm.danger ? T.err : T.warn);
     }
 
@@ -718,7 +730,8 @@ class App {
     } else if (this.flash) {
       hint = this.footer('');
     } else if (this.busy) {
-      hint = ' ' + T.accent(G.spin[this.tick % G.spin.length]) + ' ' + T.mute('menjawab…  Esc / Ctrl+C untuk menghentikan');
+      const what = this.retryInfo ? T.warn(this.retryHint()) : this.compacting ? T.mute('meringkas percakapan lama…') : T.mute('menjawab…');
+      hint = ' ' + T.accent(G.spin[this.tick % G.spin.length]) + ' ' + what + T.mute('  Esc / Ctrl+C untuk menghentikan');
     } else if (text.startsWith('/') && !text.includes('\n')) {
       const m = COMMANDS.filter(([c]) => c.startsWith(text.split(' ')[0]));
       hint = ' ' + (m.length ? m.map(([c, d]) => T.accent(c) + T.faint(' ' + d)).join(T.faint('  ' + G.sep + '  ')) : T.faint('perintah tidak dikenal — /help'));
@@ -730,7 +743,8 @@ class App {
 
     // status bar
     const L1 = ' ELEPHANT ';
-    const R = this.chat.scroll > 0 ? ` ${G.sep} gulir ${this.chat.scroll} ` : ' /help ';
+    const ctxPct = a && this.history().length ? Math.round((this.estimateNow() / this.ctxWindow()) * 100) : 0;
+    const R = this.chat.scroll > 0 ? ` ${G.sep} gulir ${this.chat.scroll} ` : ctxPct >= 1 ? ` ctx ${ctxPct}% ` : ' /help ';
     const toolsOn = this.cfg.tools !== false;
     const mode = this.cfg.mode;
     const MS = ' ' + (toolsOn ? mode : 'chat') + ' ';
@@ -828,7 +842,27 @@ class App {
       case '/provider': this.gotoProviders('chat'); break;
       case '/key': if (p) this.openForm(p, '', 'chat'); else this.gotoProviders('chat'); break;
       case '/model': this.pickModel(); break;
-      case '/clear': this.messages = []; this.chat.showLogo = true; this.sys('Percakapan dibersihkan.'); break;
+      case '/clear': this.messages = []; this.chat.showLogo = true; this.calib = 1; this.sys('Percakapan dibersihkan.'); break;
+      case '/compact': this.runCompact(arg); break;
+      case '/usage': this.sys(this.usageReport()); break;
+      case '/window': {
+        const win = this.ctxWindow();
+        if (!arg) {
+          this.sys(`Jendela konteks: ${context.fmt(win)} token (${this.cfg.window ? 'manual' : 'tebakan dari nama model'}). Auto-compact di ${Math.round(this.ctxThreshold() * 100)}%.\nUbah: /window 32000  |  /window 128k  |  /window auto`);
+          break;
+        }
+        if (arg.toLowerCase() === 'auto') {
+          delete this.cfg.window;
+        } else {
+          const m = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(arg);
+          const n = m ? Math.round(parseFloat(m[1]) * ({ k: 1000, m: 1000000 }[(m[2] || '').toLowerCase()] || 1)) : NaN;
+          if (!(n >= 2000)) { this.sys('Angka tidak valid (minimal 2000). Contoh: /window 32000, /window 128k, /window auto'); break; }
+          this.cfg.window = n;
+        }
+        store.save(this.cfg);
+        this.sys(`Jendela konteks sekarang ${context.fmt(this.ctxWindow())} token.`);
+        break;
+      }
       case '/system':
         if (!arg) this.sys('System prompt saat ini:\n' + (this.cfg.system || '(kosong)'));
         else {
@@ -910,10 +944,173 @@ class App {
 
   // Riwayat untuk API: hanya pesan percakapan (bukan catatan sistem/error).
   history() {
-    return this.messages.filter((m) =>
-      (m.role === 'user' && m.content) ||
-      (m.role === 'assistant' && (m.content || (m.toolCalls && m.toolCalls.length))) ||
-      m.role === 'tool');
+    return context.liveMessages(this.messages);
+  }
+
+  // ------------------------------------------------------------ konteks & usage
+  ctxWindow() {
+    return context.windowFor(this.cfg.active && this.cfg.active.model, this.cfg.window);
+  }
+
+  ctxThreshold() {
+    const t = Number(this.cfg.compactAt);
+    return t >= 0.3 && t <= 0.95 ? t : context.DEFAULT_THRESHOLD;
+  }
+
+  // Estimasi token request berikutnya (tanpa koreksi): system + definisi tool + riwayat.
+  estimateRaw() {
+    const useTools = this.cfg.tools !== false;
+    const key = [this.cwd, this.cfg.mode, this.cfg.tools, this.cfg.system].join('\u0001');
+    if (!this._sysTok || this._sysTok.key !== key) {
+      const defs = useTools ? tools.defsFor(this.cfg.mode) : null;
+      this._sysTok = { key, n: context.estimateRequest({ system: this.buildSystem(), messages: [], tools: defs }) };
+    }
+    return this._sysTok.n + context.estimateMessages(this.history());
+  }
+
+  estimateNow() {
+    return Math.round(this.estimateRaw() * this.calib);
+  }
+
+  trackUsage(res, raw, outText) {
+    const u = this.usage;
+    u.requests++;
+    let inp;
+    let out;
+    if (res && res.usage) {
+      inp = res.usage.input;
+      out = res.usage.output;
+      if (inp > 0 && raw > 0) this.calib = Math.max(0.5, Math.min(2.5, inp / raw));
+    } else {
+      inp = Math.round(raw * this.calib);
+      out = context.estimateText(outText);
+      u.estRequests++;
+    }
+    u.input += inp;
+    u.output += out;
+    u.last = { input: inp, output: out, estimated: !(res && res.usage) };
+  }
+
+  onRetry(info) {
+    this.usage.retries++;
+    this.retryInfo = { until: Date.now() + info.waitMs, attempt: info.attempt, max: info.max, status: info.status };
+    this.draw();
+  }
+
+  retryHint() {
+    const r = this.retryInfo;
+    const why = r.status === 429 ? 'Rate limit (429)' : r.status >= 500 ? `Server sibuk (${r.status})` : r.status ? `Error ${r.status}` : 'Koneksi putus';
+    const left = Math.ceil((r.until - Date.now()) / 1000);
+    return left > 0 ? `${why}: coba lagi dalam ${left}s (percobaan ${r.attempt}/${r.max})` : `${why}: mencoba lagi (${r.attempt}/${r.max})…`;
+  }
+
+  // Ringkas / pangkas kalau konteks mendekati penuh. Dipanggil sebelum tiap request ke model.
+  async ensureContext(signal) {
+    const win = this.ctxWindow();
+    const limit = win * this.ctxThreshold();
+    if (this.estimateNow() <= limit) return;
+    const pr = context.pruneToolResults(this.history());
+    this.usage.pruned += pr.count;
+    if (this.estimateNow() <= limit) {
+      if (pr.count) this.sys(`Konteks dihemat: ${pr.count} hasil tool lama dipotong.`);
+      return;
+    }
+    await this.compactNow({ auto: true, signal });
+  }
+
+  // Ringkas percakapan lama jadi satu pesan ringkasan. Mengembalikan true kalau konteks berhasil dikecilkan.
+  async compactNow({ auto = false, focus = '', keepRatio = 0.25, signal } = {}) {
+    const a = this.cfg.active;
+    const p = getProvider(a.provider);
+    const conf = this.cfg.providers[p.id] || {};
+    const win = this.ctxWindow();
+    const sig = signal || (this.ctrl && this.ctrl.signal);
+    const before = this.estimateNow();
+    const pr = context.pruneToolResults(this.history(), { keepRecent: 4 });
+    this.usage.pruned += pr.count;
+    const summarize = async (text, f) => {
+      let out = '';
+      const sys = context.SUMMARY_SYSTEM + (f ? `\nPay special attention to: ${f}` : '');
+      const messages = [{ role: 'user', content: `<conversation>\n${text}\n</conversation>\n\nWrite the briefing now.` }];
+      const r = await api.chat({ provider: p, conf, model: a.model, system: sys, messages, signal: sig, onDelta: (d) => { out += d; this.retryInfo = null; }, onRetry: (i) => this.onRetry(i) });
+      this.retryInfo = null;
+      this.trackUsage(r, context.estimateText(sys) + context.estimateText(messages[0].content), out);
+      return out;
+    };
+    this.compacting = true;
+    this.draw();
+    let r;
+    try {
+      r = await context.compactMessages(this.messages, { window: win, keepRatio, summarize, focus });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      if (auto && this.estimateNow() > win * 0.95) {
+        r = context.dropOld(this.messages, { window: win });
+        if (r.ok) {
+          this.sys(`Peringkasan gagal (${e.message}). Konteks hampir penuh, jadi ${r.covered} pesan lama dibuang.`);
+          return true;
+        }
+      } else {
+        this.sys(`Gagal meringkas: ${e.message}${auto ? '. Lanjut tanpa meringkas.' : ''}`);
+        return false;
+      }
+    } finally {
+      this.compacting = false;
+      this.retryInfo = null;
+    }
+    if (!r.ok) {
+      if (!auto) this.sys(`Belum ada yang perlu diringkas (${r.reason}).`);
+      return pr.count > 0;
+    }
+    this.usage.compactions++;
+    const after = this.estimateNow();
+    this.sys(`Konteks diringkas: ${r.covered} pesan lama jadi ringkasan (~${context.fmt(r.summaryTokens)} token). ~${context.fmt(before)} -> ~${context.fmt(after)} token (${Math.round((after / win) * 100)}% dari jendela).`);
+    return true;
+  }
+
+  async runCompact(focus) {
+    if (this.busy) return this.setFlash('Tunggu proses selesai (Esc untuk menghentikan).', 'warn');
+    if (!this.cfg.active) return undefined;
+    this.busy = true;
+    this.ctrl = new AbortController();
+    this.spin(true);
+    this.draw();
+    try {
+      await this.compactNow({ focus, keepRatio: 0.2 });
+    } catch (e) {
+      this.messages.push({ role: e && e.name === 'AbortError' ? 'system' : 'error', content: e && e.name === 'AbortError' ? 'Dihentikan.' : (e && e.message) || String(e) });
+    } finally {
+      this.busy = false;
+      this.ctrl = null;
+      this.spin(false);
+      this.draw();
+    }
+    return undefined;
+  }
+
+  usageReport() {
+    const win = this.ctxWindow();
+    const est = this.estimateNow();
+    const pct = Math.round((est / win) * 100);
+    const u = this.usage;
+    const live = this.history();
+    const archived = this.messages.filter((m) => m.archived).length;
+    const cells = 20;
+    const filled = Math.max(0, Math.min(cells, Math.round((est / win) * cells)));
+    const bar = (ASCII ? '#' : '█').repeat(filled) + (ASCII ? '-' : '░').repeat(cells - filled);
+    const f = context.fmt;
+    const tilde = u.estRequests ? '~' : '';
+    const lines = [
+      `Konteks: ~${f(est)} / ${f(win)} token (${pct}%)  [${bar}]`,
+      `Jendela: ${f(win)} token (${this.cfg.window ? 'manual' : 'tebakan dari nama model; ubah dengan /window'})`,
+      `Auto-compact: di ${Math.round(this.ctxThreshold() * 100)}% (~${f(win * this.ctxThreshold())} token)`,
+      `Pesan aktif: ${live.length}${archived ? `  ${G.sep}  sudah diringkas: ${archived}` : ''}`,
+      `Token sesi ini: masuk ${tilde}${f(u.input)}  ${G.sep}  keluar ${tilde}${f(u.output)}  ${G.sep}  ${u.requests} request`,
+    ];
+    if (u.last) lines.push(`Request terakhir: masuk ${u.last.estimated ? '~' : ''}${f(u.last.input)}  ${G.sep}  keluar ${u.last.estimated ? '~' : ''}${f(u.last.output)}`);
+    lines.push(`Compact: ${u.compactions}x  ${G.sep}  hasil tool dipotong: ${u.pruned}  ${G.sep}  retry: ${u.retries}`);
+    if (u.estRequests) lines.push(`(~ = estimasi; ${u.estRequests} request tidak melaporkan usage dari server)`);
+    return lines.join('\n');
   }
 
   async send(text) {
@@ -944,35 +1141,62 @@ class App {
     const conf = this.cfg.providers[p.id] || {};
     const useTools = this.cfg.tools !== false;
     const signal = this.ctrl.signal;
+    let ctxRecovered = false; // sekali per pesan: kalau server bilang konteks kepenuhan, ringkas paksa lalu ulangi
 
     for (let step = 0; step < MAX_STEPS; step++) {
+      try {
+        await this.ensureContext(signal);
+      } catch (e) {
+        if (e && e.name === 'AbortError') { this.messages.push({ role: 'system', content: 'Dihentikan.' }); return; }
+        // gagal ringkas bukan fatal: coba kirim apa adanya
+      }
       const reply = { role: 'assistant', content: '', pending: true };
       this.messages.push(reply);
       this.draw();
       let queued = false;
       let res;
+      const raw = this.estimateRaw();
       try {
         res = await api.chat({
-          provider: p, conf, model: a.model, system: this.buildSystem(), messages: this.history(),
+          provider: p, conf, model: a.model, system: this.buildSystem(), messages: this.history().filter((m) => m !== reply),
           tools: useTools ? tools.defsFor(this.cfg.mode) : undefined, signal,
+          onRetry: (info) => this.onRetry(info),
           onDelta: (d) => {
             reply.content += d;
+            this.retryInfo = null;
             if (!queued) { queued = true; setTimeout(() => { queued = false; this.draw(); }, 30); }
           },
         });
       } catch (e) {
         reply.pending = false;
+        this.retryInfo = null;
         if (e && e.name === 'AbortError') reply.stopped = true;
         else {
+          const tooBig = (e.status === 400 || e.status === 413) && /context|too many tokens|token limit|maximum.*length|too large|prompt is too long|reduce the length/i.test(e.message);
+          if (tooBig && !ctxRecovered && !reply.content) {
+            ctxRecovered = true;
+            this.messages.splice(this.messages.indexOf(reply), 1);
+            this.sys('Server bilang konteks terlalu besar. Meringkas percakapan lalu mencoba lagi…');
+            try {
+              if (await this.compactNow({ auto: true, keepRatio: 0.12, signal })) { step--; continue; }
+            } catch (e2) {
+              if (e2 && e2.name === 'AbortError') { this.messages.push({ role: 'system', content: 'Dihentikan.' }); return; }
+            }
+            this.messages.push({ role: 'error', content: e.message + '  [konteks kepenuhan: coba /compact, /clear, atau /window <angka> sesuai batas model]' });
+            return;
+          }
           let msg = e.message;
           if (useTools && e.status === 400 && /tool|function/i.test(msg)) msg += '  [model ini mungkin tidak mendukung tool: coba model lain, atau /tools off]';
+          if (tooBig) msg += '  [konteks kepenuhan: coba /compact, /clear, atau /window <angka> sesuai batas model]';
           this.messages.push({ role: 'error', content: msg });
         }
         if (!reply.content && !reply.stopped) this.messages.splice(this.messages.indexOf(reply), 1);
         return;
       }
       reply.pending = false;
+      this.retryInfo = null;
       const calls = useTools ? res.toolCalls || [] : []; // tool dimatikan: abaikan call yang tetap dikirim server
+      this.trackUsage(res, raw, reply.content + calls.map((c) => c.name + JSON.stringify(c.args || {})).join(''));
       if (!calls.length) {
         if (!reply.content) this.messages.splice(this.messages.indexOf(reply), 1);
         return;
@@ -1020,10 +1244,19 @@ class App {
     tm.status = 'running';
     this.draw();
     let r;
-    try {
-      r = await tools.execute(tm.name, tm.args, { cwd: this.cwd, signal });
-    } catch (e) {
-      r = { content: 'Error: ' + ((e && e.message) || e), isError: true };
+    const allowHosts = new Set(); // host private yang disetujui pengguna, hanya untuk panggilan ini
+    for (let round = 0; round < 4; round++) {
+      try {
+        r = await tools.execute(tm.name, tm.args, { cwd: this.cwd, signal, allowHosts });
+      } catch (e) {
+        r = { content: 'Error: ' + ((e && e.message) || e), isError: true };
+      }
+      // fetch_url kena pagar SSRF (termasuk setelah redirect): tanya pengguna, boleh sekali per host.
+      const b = r && r.blocked;
+      if (!b || b.hard || signal.aborted) break;
+      const ans = await this.askPerm(tm, true, { warn: 'akses ke jaringan lokal/private', label: `${b.host}${b.ip !== b.host ? ' (' + b.ip + ')' : ''}: ${b.kind}` });
+      if (ans !== 'yes') { r = { ...r, content: r.content + ' Pengguna menolak akses ke alamat itu.' }; break; }
+      allowHosts.add(b.hostKey);
     }
     tm.content = r.content;
     tm.isError = !!r.isError;
@@ -1032,9 +1265,9 @@ class App {
     this.draw();
   }
 
-  askPerm(tm, danger) {
+  askPerm(tm, danger, extra = {}) {
     return new Promise((resolve) => {
-      this.perm = { tm, danger, resolve };
+      this.perm = { tm, danger, resolve, ...extra };
       this.chat.scroll = 0;
       this.draw();
     });

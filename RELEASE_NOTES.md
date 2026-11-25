@@ -1,13 +1,13 @@
-## Elephant Agent v0.2.0
+## Elephant Agent v0.3.0
 
-Sekarang Elephant bukan cuma chat: dia bisa bertindak. Tool-use sudah ada.
+Percakapan panjang tidak lagi bikin konteks meledak, error rate limit diulang otomatis, dan `fetch_url` tidak bisa dipakai membobol jaringan lokal.
 
-- Tool baru: `run_command` (jalankan perintah shell), `read_file`, `write_file`, `edit_file`, `list_dir`, `search` (regex), `fetch_url`
-- Loop agent: model memanggil tool, hasilnya dikirim balik, berulang sampai tugas selesai (maks 30 langkah per pesan)
-- Izin: mode `ask` (default, baca otomatis, aksi lain ditanya: y / a = selalu di sesi / n), `auto`, dan `readonly`. Perintah berbahaya selalu ditanya
-- Perintah baru: `/tools on|off`, `/mode`, `/cwd`; mode tampil di status bar
-- Jalan di Claude, ChatGPT, Gemini, Groq, OpenRouter, dan semua endpoint OpenAI-compatible yang mendukung tool-calling
-- Esc / Ctrl+C menghentikan jawaban sekaligus proses yang sedang berjalan
-- Tetap tanpa dependency (Node.js 18+), jalan di Windows, Linux, Termux, ElephantPanel
+- Auto-compact: kalau konteks lewat 75% jendela model, hasil tool lama dipotong dulu, lalu percakapan lama diringkas model. Pesan terbaru tetap utuh
+- `/compact [fokus]` untuk meringkas manual, `/usage` untuk melihat isi konteks dan token terpakai (masuk/keluar), `/window` untuk mengatur ukuran jendela konteks. Bar status menampilkan `ctx N%`
+- Kalau server menolak karena konteks kepenuhan, Agent meringkas paksa lalu mencoba lagi sekali
+- Retry + backoff untuk 429, 5xx, dan koneksi putus (maks 4 kali), menghormati `retry-after`. Hitung mundur tampil di layar. Kuota/saldo habis dan limit harian tidak diulang, langsung diberi tahu
+- `fetch_url` sekarang diblokir ke localhost, 127.x, 10.x, 172.16-31.x, 192.168.x, CGNAT, IPv6 lokal, dan bentuk samaran (angka desimal, hex, `::ffff:127.0.0.1`). Dicek saat koneksi dan setiap redirect, jadi tahan DNS rebinding
+- Akses ke alamat private (mis. Ollama / server LAN) tetap bisa, tapi Agent bertanya dulu per host:port, juga di mode `auto`. Alamat metadata cloud (`169.254.x.x`) tidak pernah diizinkan
+- Teks dari web, file, dan output perintah diperlakukan sebagai data, bukan perintah (ditambahkan ke instruksi Agent)
 
-Catatan: ini bukan sandbox. Agent memakai hak akses akun kamu, baca perintahnya sebelum menyetujui. Model yang tidak mendukung tool bisa error: pakai `/tools off` atau ganti model.
+Catatan: ukuran jendela konteks ditebak dari nama model. Kalau providermu punya batas lebih kecil (mis. paket gratis), atur dengan `/window 16k`. Pagar SSRF hanya melindungi `fetch_url`; `run_command` tetap bisa memanggil `curl` kalau kamu menyetujuinya.

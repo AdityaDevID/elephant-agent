@@ -1,6 +1,6 @@
 {
   "name": "elephant-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Agent AI berbasis terminal (TUI) dengan tool-use (perintah, file, search): multi-provider, tanpa dependency. Windows, Linux, Termux, ElephantPanel.",
   "license": "MIT",
   "author": "AdityaDevID",
@@ -28,7 +28,7 @@
   ],
   "scripts": {
     "start": "node bin/elephant.js",
-    "test": "node test/smoke.js && node test/tools.js"
+    "test": "node test/smoke.js && node test/tools.js && node test/context.js && node test/safefetch.js"
   },
   "keywords": [
     "ai",

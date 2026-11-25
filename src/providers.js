@@ -10,7 +10,7 @@ const PROVIDERS = [
     models: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'],
   },
   {
-    id: 'openai', name: 'ChatGPT (OpenAI)', kind: 'openai',
+    id: 'openai', streamUsage: true, name: 'ChatGPT (OpenAI)', kind: 'openai',
     baseUrl: 'https://api.openai.com/v1', envKey: 'OPENAI_API_KEY',
     keyUrl: 'https://platform.openai.com/api-keys', tags: 'openai chatgpt gpt',
     models: ['gpt-4o', 'gpt-4o-mini'],
@@ -22,7 +22,7 @@ const PROVIDERS = [
     models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
   },
   {
-    id: 'groq', name: 'Groq', kind: 'openai',
+    id: 'groq', streamUsage: true, name: 'Groq', kind: 'openai',
     baseUrl: 'https://api.groq.com/openai/v1', envKey: 'GROQ_API_KEY',
     keyUrl: 'https://console.groq.com/keys', tags: 'groq llama cepat gratis',
     models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
@@ -47,7 +47,7 @@ const PROVIDERS = [
     models: [],
   },
   {
-    id: 'deepseek', name: 'DeepSeek', kind: 'openai',
+    id: 'deepseek', streamUsage: true, name: 'DeepSeek', kind: 'openai',
     baseUrl: 'https://api.deepseek.com', envKey: 'DEEPSEEK_API_KEY',
     keyUrl: 'https://platform.deepseek.com/api_keys', tags: 'deepseek',
     models: ['deepseek-chat', 'deepseek-reasoner'],
@@ -59,7 +59,7 @@ const PROVIDERS = [
     models: ['mistral-large-latest', 'mistral-small-latest'],
   },
   {
-    id: 'xai', name: 'xAI (Grok)', kind: 'openai',
+    id: 'xai', streamUsage: true, name: 'xAI (Grok)', kind: 'openai',
     baseUrl: 'https://api.x.ai/v1', envKey: 'XAI_API_KEY',
     keyUrl: 'https://console.x.ai', tags: 'xai grok',
     models: ['grok-3'],

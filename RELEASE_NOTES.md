@@ -1,13 +1,13 @@
-## Elephant Agent v0.1.0
+## Elephant Agent v0.2.0
 
-Rilis pertama: tampilan TUI + setup provider/model + chat streaming.
+Sekarang Elephant bukan cuma chat: dia bisa bertindak. Tool-use sudah ada.
 
-- TUI dengan logo, jalan di Windows, Linux, Termux, ElephantPanel (Node.js 18+, tanpa dependency)
-- Pasang API key untuk Claude, ChatGPT, Gemini, Groq, NVIDIA NIM, OpenRouter, Vikey, DeepSeek, Mistral, xAI, Together, Ollama, dan endpoint Custom OpenAI-compatible
-- Pencarian provider (ketik, atau paste key langsung untuk deteksi otomatis) dan pencarian model dari daftar live provider
-- Chat streaming dengan markdown ringan, paste multi-baris, riwayat input, scroll
-- Perintah: /help /provider /model /key /system /clear /exit
-- Lisensi MIT; terbit di npm sebagai `elephant-agent` dan `@adityadevid/elephant-agent`
-- Config tersimpan di ~/.elephant-agent/config.json (izin 0600)
+- Tool baru: `run_command` (jalankan perintah shell), `read_file`, `write_file`, `edit_file`, `list_dir`, `search` (regex), `fetch_url`
+- Loop agent: model memanggil tool, hasilnya dikirim balik, berulang sampai tugas selesai (maks 30 langkah per pesan)
+- Izin: mode `ask` (default, baca otomatis, aksi lain ditanya: y / a = selalu di sesi / n), `auto`, dan `readonly`. Perintah berbahaya selalu ditanya
+- Perintah baru: `/tools on|off`, `/mode`, `/cwd`; mode tampil di status bar
+- Jalan di Claude, ChatGPT, Gemini, Groq, OpenRouter, dan semua endpoint OpenAI-compatible yang mendukung tool-calling
+- Esc / Ctrl+C menghentikan jawaban sekaligus proses yang sedang berjalan
+- Tetap tanpa dependency (Node.js 18+), jalan di Windows, Linux, Termux, ElephantPanel
 
-Catatan: base URL Vikey diisi manual. Belum ada tool-use (file/shell).
+Catatan: ini bukan sandbox. Agent memakai hak akses akun kamu, baca perintahnya sebelum menyetujui. Model yang tidak mendukung tool bisa error: pakai `/tools off` atau ganti model.

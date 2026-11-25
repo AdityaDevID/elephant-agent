@@ -17,7 +17,7 @@ function file() {
 }
 
 function defaults() {
-  return { version: 1, active: null, providers: {}, system: DEFAULT_SYSTEM };
+  return { version: 1, active: null, providers: {}, system: DEFAULT_SYSTEM, tools: true, mode: 'ask' };
 }
 
 function load() {

@@ -1,7 +1,7 @@
 {
   "name": "elephant-agent",
-  "version": "0.1.0",
-  "description": "Agent AI berbasis terminal (TUI): multi-provider, tanpa dependency. Windows, Linux, Termux, ElephantPanel.",
+  "version": "0.2.0",
+  "description": "Agent AI berbasis terminal (TUI) dengan tool-use (perintah, file, search): multi-provider, tanpa dependency. Windows, Linux, Termux, ElephantPanel.",
   "license": "MIT",
   "author": "AdityaDevID",
   "repository": {
@@ -28,7 +28,7 @@
   ],
   "scripts": {
     "start": "node bin/elephant.js",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js && node test/tools.js"
   },
   "keywords": [
     "ai",
@@ -41,6 +41,7 @@
     "gemini",
     "groq",
     "openrouter",
-    "termux"
+    "termux",
+    "tool-use"
   ]
 }

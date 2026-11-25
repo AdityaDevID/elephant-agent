@@ -6,12 +6,15 @@ const { PROVIDERS, getProvider, detectProvider } = require('./providers');
 const store = require('./config');
 const api = require('./api');
 const logo = require('./logo');
+const tools = require('./tools');
 const pkg = require('../package.json');
+
+const MAX_STEPS = 30; // batas langkah tool per pesan, supaya agent tidak berputar tanpa henti
 
 const ASCII = process.env.ELEPHANT_ASCII === '1' || process.argv.includes('--ascii');
 const G = ASCII
-  ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', ptr: '>', bullet: '-', nl: '~', ok: 'v', x: 'x', mask: '*', spin: ['|', '/', '-', '\\'], sep: '|' }
-  : { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', ptr: '❯', bullet: '•', nl: '↵', ok: '✓', x: '✖', mask: '•', spin: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], sep: '·' };
+  ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', ptr: '>', bullet: '-', nl: '~', ok: 'v', x: 'x', mask: '*', tool: '*', spin: ['|', '/', '-', '\\'], sep: '|' }
+  : { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│', ptr: '❯', bullet: '•', nl: '↵', ok: '✓', x: '✖', mask: '•', tool: '◆', spin: ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], sep: '·' };
 
 const T = {
   accent: A.fg(208),
@@ -31,6 +34,9 @@ const COMMANDS = [
   ['/model', 'ganti model'],
   ['/key', 'ganti API key provider aktif'],
   ['/system', 'atur system prompt (/system reset)'],
+  ['/tools', 'tool on/off (jalankan perintah, baca/tulis file)'],
+  ['/mode', 'izin tool: ask | auto | readonly'],
+  ['/cwd', 'lihat / ganti folder kerja'],
   ['/clear', 'bersihkan percakapan'],
   ['/exit', 'keluar'],
 ];
@@ -211,6 +217,10 @@ class App {
     this.quitArm = 0;
     this.opId = 0;
     this.restored = false;
+    this.cwd = process.cwd();
+    this.sessionAllow = new Set(); // tool yang diizinkan "selalu" selama sesi ini
+    this.perm = null; // permintaan izin yang sedang menunggu jawaban
+    if (!tools.MODES.includes(this.cfg.mode)) this.cfg.mode = 'ask';
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -250,6 +260,7 @@ class App {
   }
 
   quit(code = 0) {
+    tools.killAll();
     this.restore();
     process.exit(code);
   }
@@ -624,15 +635,21 @@ class App {
     const out = [];
     if (this.chat.showLogo) out.push(...this.header(W, H), '');
     const model = this.cfg.active ? this.cfg.active.model : '';
-    for (const m of this.messages) {
+    for (let i = 0; i < this.messages.length; i++) {
+      const m = this.messages[i];
       if (m.role === 'user') {
         out.push(' ' + A.bold(T.blue('Kamu')));
         for (const l of m.content.split('\n')) out.push(...A.wrapText(l, W - 2, '  '));
       } else if (m.role === 'assistant') {
+        if (!m.content && !m.pending && m.toolCalls && m.toolCalls.length) continue; // hanya tool call: tak perlu header
         out.push(' ' + T.accentBold('Agent') + T.faint('  ' + model));
         if (!m.content && m.pending) out.push('  ' + T.accent(G.spin[this.tick % G.spin.length]));
         else out.push(...md(m.content || T.mute('(respons kosong)'), W));
         if (m.stopped) out.push('  ' + T.mute('(dihentikan)'));
+      } else if (m.role === 'tool') {
+        out.push(...this.toolLines(m, W));
+        const nx = this.messages[i + 1];
+        if (nx && nx.role === 'tool') continue;
       } else if (m.role === 'error') {
         out.push(...A.wrapText(T.err(G.x + ' ' + m.content), W - 2, ' '));
       } else {
@@ -640,6 +657,30 @@ class App {
       }
       out.push('');
     }
+    return out;
+  }
+
+  toolLines(m, W) {
+    const st = m.status;
+    const ico = st === 'running' ? T.accent(G.spin[this.tick % G.spin.length]) : st === 'pending' ? T.warn('?') : st === 'ok' ? T.ok(G.ok) : T.err(G.x);
+    const clean = (l) => A.strip(String(l)).replace(/\t/g, '  ').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+    const desc = tools.describe(m.name, m.args).split('\n').map(clean);
+    const out = A.wrapText(`${ico} ${A.bold(m.name)}  ${T.mute(desc[0])}`, W - 1, ' ', '     ');
+    for (const l of desc.slice(1, 6)) out.push(...A.wrapText(T.mute(l), W - 2, '     '));
+    if (desc.length > 6) out.push('     ' + T.faint(`… +${desc.length - 6} baris`));
+    if (st === 'pending') {
+      out.push('     ' + T.warn('menunggu izin…'));
+      return out;
+    }
+    if (st === 'running') return out;
+    const color = st === 'error' ? T.err : T.faint;
+    const lines = String(m.content || '').replace(/\s+$/, '').split('\n').map(clean);
+    const maxL = m.name === 'run_command' ? 8 : m.name === 'write_file' || m.name === 'edit_file' ? 2 : 3;
+    const fromEnd = m.name === 'run_command'; // output perintah: bagian akhir paling informatif
+    const shown = fromEnd ? lines.slice(-maxL) : lines.slice(0, maxL);
+    if (fromEnd && lines.length > maxL) out.push('     ' + T.faint(`… ${lines.length - maxL} baris di atas`));
+    for (const l of shown) out.push('     ' + color(A.truncate(l, W - 7)));
+    if (!fromEnd && lines.length > maxL) out.push('     ' + T.faint(`… +${lines.length - maxL} baris`));
     return out;
   }
 
@@ -661,12 +702,20 @@ class App {
     const chars = f.chars.map((c) => (c === '\n' ? G.nl : c));
     const prompt = T.accent(G.ptr) + ' ';
     const inner = prompt + inputView(chars, f.cur, iw - 2).out;
-    const boxLines = this.box(W, inner, this.busy ? T.faint : T.accent);
+    let boxLines = this.box(W, inner, this.busy ? T.faint : T.accent);
+    if (this.perm) {
+      const pm = this.perm;
+      const what = tools.describe(pm.tm.name, pm.tm.args).split('\n')[0].replace(/[\x00-\x1f\x7f]/g, ' ');
+      const lead = (pm.danger ? T.err('PERINGATAN: perintah berbahaya. ') : '') + T.warn('Izinkan ') + A.bold(pm.tm.name) + T.warn('? ');
+      boxLines = this.box(W, A.truncate(lead + T.mute(what), iw), pm.danger ? T.err : T.warn);
+    }
 
     // hint
     const text = f.value;
     let hint;
-    if (this.flash) {
+    if (this.perm) {
+      hint = ' ' + T.ok('y') + T.mute(' ya  ') + (this.perm.danger ? '' : T.accent('a') + T.mute(' ya, selalu (sesi ini)  ')) + T.err('n') + T.mute(' tidak');
+    } else if (this.flash) {
       hint = this.footer('');
     } else if (this.busy) {
       hint = ' ' + T.accent(G.spin[this.tick % G.spin.length]) + ' ' + T.mute('menjawab…  Esc / Ctrl+C untuk menghentikan');
@@ -682,15 +731,20 @@ class App {
     // status bar
     const L1 = ' ELEPHANT ';
     const R = this.chat.scroll > 0 ? ` ${G.sep} gulir ${this.chat.scroll} ` : ' /help ';
+    const toolsOn = this.cfg.tools !== false;
+    const mode = this.cfg.mode;
+    const MS = ' ' + (toolsOn ? mode : 'chat') + ' ';
+    const msBg = !toolsOn ? 238 : mode === 'auto' ? 124 : mode === 'readonly' ? 25 : 29;
     const prov = A.truncate(' ' + (p ? p.name : '-') + ' ', Math.max(10, Math.floor(W * 0.35)));
     let model = ' ' + (a ? a.model : '-') + ' ';
-    const room = W - A.strWidth(L1) - A.strWidth(prov) - A.strWidth(R);
+    const room = W - A.strWidth(L1) - A.strWidth(prov) - A.strWidth(R) - A.strWidth(MS);
     model = A.truncate(model, Math.max(0, room));
     const fill = Math.max(0, room - A.strWidth(model));
     const bar =
       A.bg(208)(A.fg(16)(A.bold(L1))) +
       A.bg(238)(A.fg(252)(prov)) +
       A.bg(236)(A.fg(250)(model + ' '.repeat(fill))) +
+      A.bg(msBg)(A.fg(255)(MS)) +
       A.bg(236)(A.fg(245)(R));
     return [...view, ...boxLines, hint, bar];
   }
@@ -698,6 +752,15 @@ class App {
   chatKey(str, key) {
     const f = this.chat.field;
     const c = this.chat;
+    if (this.perm) {
+      const k = (str || '').toLowerCase();
+      if (k === 'y' || key.name === 'return') return this.answerPerm('yes');
+      if (k === 'a' && !this.perm.danger) return this.answerPerm('always');
+      if (k === 'n' || key.name === 'escape') return this.answerPerm('no');
+      if (key.name === 'pageup') { c.scroll += Math.max(3, (process.stdout.rows || 24) - 8); return this.draw(); }
+      if (key.name === 'pagedown') { c.scroll = Math.max(0, c.scroll - Math.max(3, (process.stdout.rows || 24) - 8)); return this.draw(); }
+      return undefined;
+    }
     if (key.name === 'return') {
       if (this.pasting || key.meta) { f.insert('\n'); return this.draw(); }
       return this.submitChat();
@@ -757,7 +820,8 @@ class App {
           '', 'Shortcut:',
           '  Enter kirim  |  Ctrl+J baris baru  |  Esc hentikan jawaban',
           '  PgUp/PgDn gulir  |  Atas/Bawah riwayat input  |  Tab lengkapi perintah',
-          '  Ctrl+A/E awal/akhir baris  |  Ctrl+U/K/W hapus  |  Ctrl+C keluar (2x)'];
+          '  Ctrl+A/E awal/akhir baris  |  Ctrl+U/K/W hapus  |  Ctrl+C keluar (2x)',
+          '', 'Saat Agent minta izin: y ya  |  a ya, selalu (sesi ini)  |  n / Esc tidak'];
         this.sys(lines.join('\n'));
         break;
       }
@@ -773,6 +837,46 @@ class App {
           this.sys(arg === 'reset' ? 'System prompt dikembalikan ke default.' : 'System prompt diperbarui.');
         }
         break;
+      case '/tools': {
+        const v = arg.toLowerCase();
+        if (v === 'on' || v === 'off') {
+          this.cfg.tools = v === 'on';
+          store.save(this.cfg);
+          this.sys(this.cfg.tools ? `Tool aktif (mode ${this.cfg.mode}).` : 'Tool dimatikan: Elephant hanya mengobrol.');
+        } else {
+          const list = tools.defsFor(this.cfg.mode).map((d) => `  ${d.name.padEnd(12)} ${d.risk === 'read' ? 'baca (otomatis)' : d.risk === 'exec' ? 'jalankan perintah' : d.risk === 'net' ? 'akses jaringan' : 'tulis file'}`);
+          this.sys([`Tool: ${this.cfg.tools !== false ? 'aktif' : 'mati'}  ${G.sep}  mode: ${this.cfg.mode}  ${G.sep}  folder: ${this.cwd}`, ...list, '/tools on | off  untuk mengganti'].join('\n'));
+        }
+        break;
+      }
+      case '/mode': {
+        const v = arg.toLowerCase();
+        if (!tools.MODES.includes(v)) {
+          this.sys(['Mode izin tool (sekarang: ' + this.cfg.mode + '):',
+            '  ask       baca file otomatis; tulis file, jalankan perintah, dan akses web minta izin (default)',
+            '  auto      semua jalan tanpa tanya (hati-hati; perintah berbahaya tetap ditanya)',
+            '  readonly  hanya baca & cari, tidak bisa mengubah apa pun',
+            'Contoh: /mode auto'].join('\n'));
+        } else {
+          this.cfg.mode = v;
+          this.sessionAllow.clear();
+          store.save(this.cfg);
+          this.sys(v === 'auto' ? 'Mode auto: Agent menjalankan perintah & mengubah file TANPA bertanya. Pantau layar, tekan Esc untuk menghentikan.' : `Mode ${v}.`);
+        }
+        break;
+      }
+      case '/cwd': {
+        if (!arg) { this.sys('Folder kerja: ' + this.cwd); break; }
+        const target = require('path').resolve(this.cwd, arg.replace(/^~(?=$|[\\/])/, require('os').homedir()));
+        try {
+          if (!require('fs').statSync(target).isDirectory()) throw new Error('bukan folder');
+          this.cwd = target;
+          this.sys('Folder kerja: ' + target);
+        } catch (e) {
+          this.sys(`Tidak bisa pindah ke ${target}: ${e.code === 'ENOENT' ? 'tidak ada' : e.message}`);
+        }
+        break;
+      }
       case '/exit': case '/quit': this.quit(0); break;
       default: this.sys(`Perintah tidak dikenal: ${cmd}. Ketik /help.`);
     }
@@ -798,35 +902,34 @@ class App {
     return this.openModels(p, models, 'chat', note);
   }
 
+  buildSystem() {
+    const base = this.cfg.system || '';
+    if (this.cfg.tools === false) return base;
+    return base + '\n\n' + tools.agentPrompt(this.cwd, this.cfg.mode);
+  }
+
+  // Riwayat untuk API: hanya pesan percakapan (bukan catatan sistem/error).
+  history() {
+    return this.messages.filter((m) =>
+      (m.role === 'user' && m.content) ||
+      (m.role === 'assistant' && (m.content || (m.toolCalls && m.toolCalls.length))) ||
+      m.role === 'tool');
+  }
+
   async send(text) {
-    const a = this.cfg.active;
-    const p = getProvider(a.provider);
-    const conf = this.cfg.providers[p.id] || {};
     this.chat.showLogo = this.chat.showLogo && this.messages.length < 2;
     this.messages.push({ role: 'user', content: text });
-    const reply = { role: 'assistant', content: '', pending: true };
-    this.messages.push(reply);
-    const history = this.messages.filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content);
     this.busy = true;
     this.ctrl = new AbortController();
     this.chat.scroll = 0;
     this.spin(true);
     this.draw();
-    let queued = false;
     try {
-      await api.chat({
-        provider: p, conf, model: a.model, system: this.cfg.system, messages: history, signal: this.ctrl.signal,
-        onDelta: (d) => {
-          reply.content += d;
-          if (!queued) { queued = true; setTimeout(() => { queued = false; this.draw(); }, 30); }
-        },
-      });
+      await this.agentLoop();
     } catch (e) {
-      if (e && e.name === 'AbortError') reply.stopped = true;
-      else this.messages.push({ role: 'error', content: e.message });
+      this.messages.push({ role: 'error', content: (e && e.message) || String(e) });
     } finally {
-      reply.pending = false;
-      if (!reply.content && !reply.stopped) this.messages.splice(this.messages.indexOf(reply), 1);
+      this.perm = null;
       this.busy = false;
       this.ctrl = null;
       this.spin(false);
@@ -834,7 +937,119 @@ class App {
     }
   }
 
+  // Minta jawaban model; kalau model memanggil tool, jalankan lalu kirim hasilnya balik, ulangi sampai selesai.
+  async agentLoop() {
+    const a = this.cfg.active;
+    const p = getProvider(a.provider);
+    const conf = this.cfg.providers[p.id] || {};
+    const useTools = this.cfg.tools !== false;
+    const signal = this.ctrl.signal;
+
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const reply = { role: 'assistant', content: '', pending: true };
+      this.messages.push(reply);
+      this.draw();
+      let queued = false;
+      let res;
+      try {
+        res = await api.chat({
+          provider: p, conf, model: a.model, system: this.buildSystem(), messages: this.history(),
+          tools: useTools ? tools.defsFor(this.cfg.mode) : undefined, signal,
+          onDelta: (d) => {
+            reply.content += d;
+            if (!queued) { queued = true; setTimeout(() => { queued = false; this.draw(); }, 30); }
+          },
+        });
+      } catch (e) {
+        reply.pending = false;
+        if (e && e.name === 'AbortError') reply.stopped = true;
+        else {
+          let msg = e.message;
+          if (useTools && e.status === 400 && /tool|function/i.test(msg)) msg += '  [model ini mungkin tidak mendukung tool: coba model lain, atau /tools off]';
+          this.messages.push({ role: 'error', content: msg });
+        }
+        if (!reply.content && !reply.stopped) this.messages.splice(this.messages.indexOf(reply), 1);
+        return;
+      }
+      reply.pending = false;
+      const calls = useTools ? res.toolCalls || [] : []; // tool dimatikan: abaikan call yang tetap dikirim server
+      if (!calls.length) {
+        if (!reply.content) this.messages.splice(this.messages.indexOf(reply), 1);
+        return;
+      }
+
+      // Semua tool call dicatat dulu supaya riwayat selalu lengkap (tiap call punya hasil), walau dibatalkan.
+      reply.toolCalls = calls;
+      const tms = calls.map((c) => ({
+        role: 'tool', toolCallId: c.id, name: c.name, args: c.args, argError: c.argError, content: '', status: 'pending',
+      }));
+      this.messages.push(...tms);
+      this.draw();
+      for (const tm of tms) {
+        if (signal.aborted) {
+          tm.content = 'Dibatalkan oleh pengguna.';
+          tm.status = 'error';
+          tm.isError = true;
+          continue;
+        }
+        await this.runTool(tm, signal);
+      }
+      if (signal.aborted) {
+        this.messages.push({ role: 'system', content: 'Dihentikan.' });
+        return;
+      }
+    }
+    this.sys(`Batas ${MAX_STEPS} langkah tool tercapai. Ketik "lanjut" kalau mau meneruskan.`);
+  }
+
+  async runTool(tm, signal) {
+    const fail = (msg) => { tm.content = msg; tm.status = 'error'; tm.isError = true; this.draw(); };
+    const def = tools.getDef(tm.name);
+    if (!def) return fail(`Error: tool tidak dikenal: ${tm.name}`);
+    if (tm.argError) return fail(`Error: ${tm.argError}. Kirim ulang tool call dengan argumen JSON yang valid.`);
+    if (this.cfg.mode === 'readonly' && def.risk !== 'read') return fail('Ditolak: mode readonly, hanya boleh membaca. Jelaskan perubahan yang diperlukan kepada pengguna.');
+
+    const danger = tm.name === 'run_command' && tools.isDangerous(tm.args.command);
+    if (tools.needsApproval(def, tm.args, this.cfg.mode, this.sessionAllow)) {
+      const ans = await this.askPerm(tm, danger);
+      if (ans === 'no') {
+        return fail(signal.aborted ? 'Dibatalkan oleh pengguna.' : 'Ditolak oleh pengguna. Jangan ulangi aksi yang sama; tanyakan apa yang diinginkan pengguna.');
+      }
+      if (ans === 'always') this.sessionAllow.add(tm.name);
+    }
+    tm.status = 'running';
+    this.draw();
+    let r;
+    try {
+      r = await tools.execute(tm.name, tm.args, { cwd: this.cwd, signal });
+    } catch (e) {
+      r = { content: 'Error: ' + ((e && e.message) || e), isError: true };
+    }
+    tm.content = r.content;
+    tm.isError = !!r.isError;
+    tm.status = r.isError ? 'error' : 'ok';
+    this.chat.scroll = 0;
+    this.draw();
+  }
+
+  askPerm(tm, danger) {
+    return new Promise((resolve) => {
+      this.perm = { tm, danger, resolve };
+      this.chat.scroll = 0;
+      this.draw();
+    });
+  }
+
+  answerPerm(ans) {
+    const pm = this.perm;
+    if (!pm) return;
+    this.perm = null;
+    pm.resolve(ans);
+    this.draw();
+  }
+
   stopStream() {
+    if (this.perm) this.answerPerm('no');
     if (this.ctrl) this.ctrl.abort();
   }
 

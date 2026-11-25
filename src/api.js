@@ -120,23 +120,104 @@ async function readSSE(res, onEvent) {
   flush(true);
 }
 
-async function chat({ provider, conf = {}, model, system, messages, signal, onDelta }) {
+// ---- konversi pesan internal -> format API.
+// Pesan internal: {role:'user'|'assistant', content, toolCalls?:[{id,name,args}]} dan {role:'tool', toolCallId, content, isError?}.
+
+function toOpenAI(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      out.push({ role: 'tool', tool_call_id: m.toolCallId, content: m.content || '(tidak ada output)' });
+      continue;
+    }
+    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length) {
+      out.push({
+        role: 'assistant',
+        content: m.content || null,
+        tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args || {}) } })),
+      });
+      continue;
+    }
+    if (!m.content) continue;
+    const last = out[out.length - 1];
+    if (last && last.role === m.role && typeof last.content === 'string' && !last.tool_calls) last.content += '\n\n' + m.content;
+    else out.push({ role: m.role, content: m.content });
+  }
+  return out;
+}
+
+function toAnthropic(messages) {
+  const out = [];
+  const push = (role, block) => {
+    const last = out[out.length - 1];
+    if (last && last.role === role) last.content.push(block);
+    else out.push({ role, content: [block] });
+  };
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      const b = { type: 'tool_result', tool_use_id: m.toolCallId, content: m.content || '(tidak ada output)' };
+      if (m.isError) b.is_error = true;
+      push('user', b);
+    } else if (m.role === 'assistant') {
+      if (m.content) push('assistant', { type: 'text', text: m.content });
+      for (const c of m.toolCalls || []) push('assistant', { type: 'tool_use', id: c.id, name: c.name, input: c.args || {} });
+    } else if (m.content) {
+      push('user', { type: 'text', text: m.content });
+    }
+  }
+  // Semua blok teks -> string (sama seperti sebelum ada tool).
+  for (const m of out) {
+    if (m.content.every((b) => b.type === 'text')) m.content = m.content.map((b) => b.text).join('\n\n');
+  }
+  return out;
+}
+
+function parseArgs(raw) {
+  if (raw && typeof raw === 'object') return { args: raw };
+  if (!raw || !String(raw).trim()) return { args: {} };
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === 'object' && !Array.isArray(v)) return { args: v };
+    return { args: {}, argError: 'argumen tool bukan objek JSON' };
+  } catch {
+    return { args: {}, argError: 'argumen tool berupa JSON yang rusak atau terpotong' };
+  }
+}
+
+// Daftar slot tool-call hasil streaming -> [{id,name,args,argError?}]
+function finishCalls(slots) {
+  const out = [];
+  slots.forEach((s, i) => {
+    if (!s || !s.name) return;
+    const { args, argError } = parseArgs(s.args);
+    const c = { id: s.id || `call_${Date.now().toString(36)}_${i}`, name: s.name, args };
+    if (argError) c.argError = argError;
+    out.push(c);
+  });
+  return out;
+}
+
+// Mengembalikan { toolCalls: [...], stopReason }.
+async function chat({ provider, conf = {}, model, system, messages, tools, signal, onDelta }) {
   const base = baseOf(provider, conf);
   const key = keyOf(provider, conf);
-  const msgs = normalize(messages);
+  const anthropic = provider.kind === 'anthropic';
+  const hasTools = Array.isArray(tools) && tools.length > 0;
   let url;
   let headers;
   let body;
-  if (provider.kind === 'anthropic') {
+  if (anthropic) {
     url = `${base}/v1/messages`;
     headers = { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
-    body = { model, max_tokens: 8192, stream: true, messages: msgs };
+    body = { model, max_tokens: 8192, stream: true, messages: toAnthropic(messages) };
     if (system) body.system = system;
+    if (hasTools) body.tools = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
   } else {
     url = `${base}/chat/completions`;
     headers = { 'content-type': 'application/json' };
     if (key) headers.Authorization = `Bearer ${key}`;
-    body = { model, stream: true, messages: [...(system ? [{ role: 'system', content: system }] : []), ...msgs] };
+    body = { model, stream: true, messages: [...(system ? [{ role: 'system', content: system }] : []), ...toOpenAI(messages)] };
+    if (hasTools) body.tools = tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.parameters } }));
   }
   const res = await doFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
   if (!res.ok) throw await httpError(res);
@@ -145,26 +226,61 @@ async function chat({ provider, conf = {}, model, system, messages, signal, onDe
   if (ctype.includes('application/json')) {
     // Server mengabaikan stream: ambil jawaban utuh.
     const j = await res.json();
-    const text =
-      (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) ||
-      (Array.isArray(j.content) && j.content.map((c) => c.text || '').join('')) || '';
+    let text = '';
+    const slots = [];
+    if (Array.isArray(j.content)) {
+      for (const c of j.content) {
+        if (c.type === 'text') text += c.text || '';
+        else if (c.type === 'tool_use') slots.push({ id: c.id, name: c.name, args: c.input });
+      }
+    } else {
+      const msg = j.choices && j.choices[0] && j.choices[0].message;
+      text = (msg && msg.content) || '';
+      for (const c of (msg && msg.tool_calls) || []) slots.push({ id: c.id, name: c.function && c.function.name, args: c.function && c.function.arguments });
+    }
     if (text) onDelta(text);
-    return;
+    return { toolCalls: finishCalls(slots), stopReason: null };
   }
 
+  const slots = [];
+  let stopReason = null;
   await readSSE(res, (data, event) => {
     if (data === '[DONE]') return;
     let j;
     try { j = JSON.parse(data); } catch { return; }
-    if (provider.kind === 'anthropic') {
+    if (anthropic) {
       if (event === 'error' || j.type === 'error') throw new Error((j.error && j.error.message) || 'Error dari server');
-      if (j.type === 'content_block_delta' && j.delta && j.delta.type === 'text_delta') onDelta(j.delta.text);
+      if (j.type === 'content_block_start' && j.content_block && j.content_block.type === 'tool_use') {
+        slots[j.index] = { id: j.content_block.id, name: j.content_block.name, args: '' };
+      } else if (j.type === 'content_block_delta' && j.delta) {
+        if (j.delta.type === 'text_delta') onDelta(j.delta.text);
+        else if (j.delta.type === 'input_json_delta' && slots[j.index]) slots[j.index].args += j.delta.partial_json || '';
+      } else if (j.type === 'message_delta' && j.delta && j.delta.stop_reason) {
+        stopReason = j.delta.stop_reason;
+      }
     } else {
       if (j.error) throw new Error(typeof j.error === 'string' ? j.error : j.error.message || 'Error dari server');
-      const d = j.choices && j.choices[0] && j.choices[0].delta;
-      if (d && typeof d.content === 'string' && d.content) onDelta(d.content);
+      const ch = j.choices && j.choices[0];
+      const d = ch && ch.delta;
+      if (ch && ch.finish_reason) stopReason = ch.finish_reason;
+      if (!d) return;
+      if (typeof d.content === 'string' && d.content) onDelta(d.content);
+      for (const tc of d.tool_calls || []) {
+        // Sebagian provider (mis. Gemini) tidak mengirim index: id baru = slot baru.
+        let idx = typeof tc.index === 'number' ? tc.index : tc.id ? slots.length : Math.max(0, slots.length - 1);
+        if (!slots[idx]) slots[idx] = { id: tc.id || '', name: '', args: '' };
+        const s = slots[idx];
+        if (tc.id && !s.id) s.id = tc.id;
+        if (tc.function) {
+          if (tc.function.name && !s.name) s.name = tc.function.name;
+          if (typeof tc.function.arguments === 'string') s.args += tc.function.arguments;
+          else if (tc.function.arguments && typeof tc.function.arguments === 'object') s.args = tc.function.arguments;
+        }
+      }
     }
   });
+  const calls = finishCalls(slots); // JSON terpotong (max_tokens) otomatis jadi argError
+  return { toolCalls: calls, stopReason };
 }
 
-module.exports = { listModels, chat, normalize, baseOf, keyOf };
+module.exports = { listModels, chat, normalize, toOpenAI, toAnthropic, baseOf, keyOf };

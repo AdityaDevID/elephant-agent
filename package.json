@@ -8,9 +8,9 @@
     "type": "git",
     "url": "git+https://github.com/AdityaDevID/elephant-agent.git"
   },
-  "homepage": "https://github.com/adityadevid/elephant-agent#readme",
+  "homepage": "https://github.com/AdityaDevID/elephant-agent#readme",
   "bugs": {
-    "url": "https://github.com/adityadevid/elephant-agent/issues"
+    "url": "https://github.com/AdityaDevID/elephant-agent/issues"
   },
   "bin": {
     "elephant": "bin/elephant.js",

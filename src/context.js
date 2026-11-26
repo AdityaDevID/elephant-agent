@@ -20,9 +20,13 @@ const WINDOWS = [
   [/gpt-3\.5|llama-?3(?![.\d])|llama3(?![.\d])|gemma/i, 8000],
 ];
 
-function windowFor(model, override) {
+// Ollama memakai konteks kecil secara default (sekitar 4096) dan memotong diam-diam bagian awal prompt kalau kelebihan.
+const OLLAMA_WINDOW = 8000;
+
+function windowFor(model, override, providerId) {
   const n = Number(override);
   if (Number.isFinite(n) && n >= 2000) return Math.floor(n);
+  if (providerId === 'ollama') return OLLAMA_WINDOW;
   const id = String(model || '');
   for (const [re, w] of WINDOWS) if (re.test(id)) return w;
   return DEFAULT_WINDOW;

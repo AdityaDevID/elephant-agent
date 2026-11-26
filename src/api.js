@@ -96,7 +96,28 @@ async function withRetry(fn, { signal, onRetry } = {}) {
   }
 }
 
-const baseOf = (provider, conf) => String(conf.baseUrl || provider.baseUrl || '').replace(/\/+$/, '');
+// Rapikan Base URL: tambah http:// kalau lupa, 0.0.0.0 -> 127.0.0.1, dan untuk Ollama pastikan berakhiran /v1
+// (orang sering menempel http://localhost:11434 atau .../api saja).
+function normalizeBase(provider, raw) {
+  let b = String(raw || '').trim().replace(/\/+$/, '');
+  if (!b) return '';
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(b)) b = 'http://' + b;
+  if (provider && provider.id === 'ollama') {
+    try {
+      const u = new URL(b);
+      if (u.hostname === '0.0.0.0') u.hostname = '127.0.0.1';
+      let p = u.pathname.replace(/\/+$/, '').replace(/\/api(\/.*)?$/, '');
+      if (!/\/v1$/.test(p)) p += '/v1';
+      u.pathname = p;
+      u.search = '';
+      u.hash = '';
+      b = u.toString().replace(/\/+$/, '');
+    } catch { /* biarkan apa adanya */ }
+  }
+  return b.replace(/\/+$/, '');
+}
+
+const baseOf = (provider, conf) => normalizeBase(provider, conf.baseUrl || provider.baseUrl);
 const keyOf = (provider, conf) => conf.apiKey || (provider.envKey && process.env[provider.envKey]) || '';
 
 async function httpError(res) {
@@ -124,27 +145,102 @@ async function httpError(res) {
   err.retryAfterMs = parseRetryAfter(res.headers, raw);
   err.retryable = RETRY_STATUS.has(res.status) && !NO_RETRY_BODY.test(raw);
   err.bodyText = raw.slice(0, 2000);
+  err.noTools = res.status === 400 && /does not support tools|doesn't support tools|tools? (is|are) not supported/i.test(raw);
   return err;
 }
 
+const CONNECT_CODES = new Set(['ECONNREFUSED', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH']);
+
+function causeCode(e) {
+  const c = e && e.cause;
+  if (!c) return '';
+  if (c.code) return c.code;
+  if (Array.isArray(c.errors) && c.errors[0] && c.errors[0].code) return c.errors[0].code;
+  return '';
+}
+
+// "localhost" di Node 18+ sering di-resolve ke ::1 dulu, padahal Ollama (dan banyak server lokal) hanya
+// mendengarkan di 127.0.0.1. Kalau koneksi ke localhost gagal, coba 127.0.0.1 lalu [::1].
+function localhostAlternatives(url) {
+  if (!/^[a-z][a-z0-9+.-]*:\/\/localhost(?=[:/?#]|$)/i.test(url)) return [];
+  return ['127.0.0.1', '[::1]'].map((h) => url.replace(/^([a-z][a-z0-9+.-]*:\/\/)localhost(?=[:/?#]|$)/i, `$1${h}`));
+}
+
 async function doFetch(url, opts) {
-  try {
-    return await fetch(url, opts);
-  } catch (e) {
-    if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
-      if (opts.signal && opts.signal.aborted && e.name === 'AbortError') throw e;
-      throw new Error(`Timeout setelah ${TIMEOUT_MS / 1000} detik`);
+  const urls = [url, ...localhostAlternatives(url)];
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    try {
+      return await fetch(urls[i], opts);
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || e.name === 'TimeoutError')) {
+        if (opts.signal && opts.signal.aborted && e.name === 'AbortError') throw e;
+        throw new Error(`Timeout setelah ${TIMEOUT_MS / 1000} detik`);
+      }
+      lastErr = e;
+      if (i < urls.length - 1 && CONNECT_CODES.has(causeCode(e))) continue;
+      break;
     }
-    let host = url;
-    try { host = new URL(url).host; } catch { /* biarkan */ }
-    const cause = (e && e.cause && (e.cause.code || e.cause.message)) || (e && e.message) || 'unknown';
-    const err = new Error(`Tidak bisa terhubung ke ${host} (${cause})`);
-    err.retryable = RETRY_NET_CODES.has(e && e.cause && e.cause.code);
-    throw err;
   }
+  const e = lastErr;
+  let host = url;
+  try { host = new URL(url).host; } catch { /* biarkan */ }
+  const cause = causeCode(e) || (e && e.cause && e.cause.message) || (e && e.message) || 'unknown';
+  const err = new Error(`Tidak bisa terhubung ke ${host} (${cause})`);
+  err.retryable = RETRY_NET_CODES.has(e && e.cause && e.cause.code);
+  err.connectFail = true;
+  throw err;
+}
+
+// Pesan yang lebih membantu untuk masalah umum Ollama lokal.
+function ollamaHint(provider, e) {
+  if (!provider || provider.id !== 'ollama' || !e || e.ollamaHinted) return e;
+  if (e.connectFail) {
+    e.message += '. Ollama belum jalan? Jalankan "ollama serve" (atau buka app Ollama) dan cek Base URL (default http://127.0.0.1:11434)';
+    e.ollamaHinted = true;
+  } else if (e.status === 404 && /model.*not found|try pulling/i.test(e.message)) {
+    e.message += '. Model belum diunduh: jalankan "ollama pull <nama-model>"';
+    e.ollamaHinted = true;
+  }
+  return e;
+}
+
+// Daftar model native Ollama (/api/tags): cadangan kalau /v1/models tidak ada (Ollama lama) atau kosong.
+async function ollamaTags(provider, conf) {
+  const base = baseOf(provider, conf).replace(/\/v1$/, '');
+  const res = await doFetch(`${base}/api/tags`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (!res.ok) throw await httpError(res);
+  const j = await res.json();
+  const seen = new Set();
+  const list = [];
+  for (const m of (j && j.models) || []) {
+    const id = String((m && (m.name || m.model)) || '');
+    if (!id || seen.has(id) || NON_CHAT.test(id)) continue;
+    seen.add(id);
+    list.push({ id, name: id });
+  }
+  return list.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 async function listModels(provider, conf = {}) {
+  let list = [];
+  let firstErr = null;
+  try {
+    list = await listModelsV1(provider, conf);
+  } catch (e) {
+    firstErr = e;
+  }
+  if (provider.id === 'ollama' && (firstErr ? !firstErr.connectFail : !list.length)) {
+    try { list = await ollamaTags(provider, conf); if (list.length) firstErr = null; } catch { /* pakai error asli */ }
+    if (!list.length && !firstErr) {
+      throw new Error('Ollama jalan, tapi belum ada model. Unduh dulu, mis.: ollama pull llama3.2 (lalu coba lagi)');
+    }
+  }
+  if (firstErr) throw ollamaHint(provider, firstErr);
+  return list;
+}
+
+async function listModelsV1(provider, conf = {}) {
   const base = baseOf(provider, conf);
   const key = keyOf(provider, conf);
   if (!base) throw new Error('Base URL kosong');
@@ -363,7 +459,7 @@ async function chat({ provider, conf = {}, model, system, messages, tools, signa
       throw e;
     }
   };
-  return withRetry(attempt, { signal, onRetry });
+  return withRetry(attempt, { signal, onRetry }).catch((e) => { throw ollamaHint(provider, e); });
 }
 
 async function readReply(res, anthropic, onDelta) {
@@ -444,4 +540,4 @@ async function readReply(res, anthropic, onDelta) {
   return { toolCalls: calls, stopReason, usage: uIn || uOut ? { input: uIn, output: uOut } : null };
 }
 
-module.exports = { listModels, chat, normalize, toOpenAI, toAnthropic, baseOf, keyOf, retry, parseRetryAfter, parseDuration, withRetry, fmtWait };
+module.exports = { listModels, chat, normalize, normalizeBase, localhostAlternatives, toOpenAI, toAnthropic, baseOf, keyOf, retry, parseRetryAfter, parseDuration, withRetry, fmtWait };

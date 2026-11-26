@@ -1,13 +1,20 @@
-## Elephant Agent v0.3.0
+## Elephant Agent v0.4.0
 
-Percakapan panjang tidak lagi bikin konteks meledak, error rate limit diulang otomatis, dan `fetch_url` tidak bisa dipakai membobol jaringan lokal.
+Agent sekarang bisa bekerja di GitHub lewat token, jalan terus di background sebagai daemon, dan Ollama lokal akhirnya tersambung.
 
-- Auto-compact: kalau konteks lewat 75% jendela model, hasil tool lama dipotong dulu, lalu percakapan lama diringkas model. Pesan terbaru tetap utuh
-- `/compact [fokus]` untuk meringkas manual, `/usage` untuk melihat isi konteks dan token terpakai (masuk/keluar), `/window` untuk mengatur ukuran jendela konteks. Bar status menampilkan `ctx N%`
-- Kalau server menolak karena konteks kepenuhan, Agent meringkas paksa lalu mencoba lagi sekali
-- Retry + backoff untuk 429, 5xx, dan koneksi putus (maks 4 kali), menghormati `retry-after`. Hitung mundur tampil di layar. Kuota/saldo habis dan limit harian tidak diulang, langsung diberi tahu
-- `fetch_url` sekarang diblokir ke localhost, 127.x, 10.x, 172.16-31.x, 192.168.x, CGNAT, IPv6 lokal, dan bentuk samaran (angka desimal, hex, `::ffff:127.0.0.1`). Dicek saat koneksi dan setiap redirect, jadi tahan DNS rebinding
-- Akses ke alamat private (mis. Ollama / server LAN) tetap bisa, tapi Agent bertanya dulu per host:port, juga di mode `auto`. Alamat metadata cloud (`169.254.x.x`) tidak pernah diizinkan
-- Teks dari web, file, dan output perintah diperlakukan sebagai data, bukan perintah (ditambahkan ke instruksi Agent)
+**GitHub (token)**
+- `elephant github login` / `/github`: simpan Personal Access Token (disamarkan, file chmod 600, terpisah dari config). Tool `gh_*` muncul setelah token ada: baca repo/issue/PR/Actions, cari kode, commit file, buat branch/PR/issue/komentar, `gh_api` untuk sisanya
+- Kalau token kurang izin atau tidak punya akses ke repo, Agent berhenti dan bilang izin apa yang kurang (dari header GitHub), tidak mencoba menembus
+- Rate limit GitHub dan jaringan putus ditunggu otomatis lalu dilanjutkan
+- `git` lewat `run_command` otomatis terautentikasi ke github.com tanpa menaruh token di URL/file. Token disaring dari semua output tool dan log, dan hanya dikirim ke `api.github.com`
+- Merge PR, `DELETE`, dan perubahan sensitif (visibilitas, collaborator, secret, webhook, branch protection) selalu butuh persetujuan
 
-Catatan: ukuran jendela konteks ditebak dari nama model. Kalau providermu punya batas lebih kecil (mis. paket gratis), atur dengan `/window 16k`. Pagar SSRF hanya melindungi `fetch_url`; `run_command` tetap bisa memanggil `curl` kalau kamu menyetujuinya.
+**Daemon**
+- `elephant daemon [--detach]` + `send`, `tasks`, `status`, `logs`, `cancel`, `stop`; tugas berulang dengan `--every`; kontrol HTTP lokal opsional (`--http`, wajib token)
+- Kena limit, kuota habis, atau internet putus: menunggu lalu menyambung lagi sendiri sampai berhasil
+- Tanpa manusia untuk ditanya: mode `auto` (default), `ask` + `--allow`, atau `readonly`. Aksi berbahaya ditolak kecuali `--allow-dangerous`
+
+**Ollama lokal**
+- Base URL dirapikan (tanpa `/v1`, `/api`, `0.0.0.0`), `localhost` yang gagal dicoba ulang ke `127.0.0.1`/`[::1]`, daftar model cadangan lewat `/api/tags`, pesan error menyebut `ollama serve` / `ollama pull`, model tanpa dukungan tool lanjut sebagai chat biasa, jendela konteks default 8k
+
+Catatan: mode `auto` di daemon menjalankan perintah dan mengubah file tanpa konfirmasi. Pakai token dengan izin seminimal mungkin dan folder kerja yang aman.

@@ -1,5 +1,20 @@
 'use strict';
 
+// Base URL default Ollama: ikut env OLLAMA_HOST kalau ada (mis. "0.0.0.0:11434" atau "http://192.168.1.5:11434").
+// Pakai 127.0.0.1, bukan "localhost": di Node baru "localhost" bisa jadi ::1 padahal Ollama hanya di IPv4.
+function ollamaBase() {
+  const h = String(process.env.OLLAMA_HOST || '').trim();
+  if (!h) return 'http://127.0.0.1:11434/v1';
+  try {
+    const u = new URL(/^[a-z]+:\/\//i.test(h) ? h : 'http://' + h);
+    if (u.hostname === '0.0.0.0') u.hostname = '127.0.0.1';
+    if (!u.port && u.protocol === 'http:') u.port = '11434';
+    return u.origin + '/v1';
+  } catch {
+    return 'http://127.0.0.1:11434/v1';
+  }
+}
+
 // kind: 'anthropic' = API Messages Anthropic; 'openai' = semua yang OpenAI-compatible.
 // `models` hanya cadangan kalau daftar model live gagal diambil.
 const PROVIDERS = [
@@ -72,7 +87,8 @@ const PROVIDERS = [
   },
   {
     id: 'ollama', name: 'Ollama (lokal)', kind: 'openai',
-    baseUrl: 'http://localhost:11434/v1', askBaseUrl: true, needsKey: false,
+    baseUrl: ollamaBase(), askBaseUrl: true, needsKey: false,
+    baseUrlHint: 'default http://127.0.0.1:11434 (Ollama harus sedang jalan: ollama serve)',
     keyUrl: '', tags: 'ollama lokal local offline',
     models: [],
   },
@@ -106,4 +122,4 @@ function detectProvider(key) {
   return null;
 }
 
-module.exports = { PROVIDERS, getProvider, detectProvider };
+module.exports = { PROVIDERS, getProvider, detectProvider, ollamaBase };

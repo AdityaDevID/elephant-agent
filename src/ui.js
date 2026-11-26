@@ -7,6 +7,7 @@ const store = require('./config');
 const api = require('./api');
 const logo = require('./logo');
 const tools = require('./tools');
+const gh = require('./github');
 const context = require('./context');
 const pkg = require('../package.json');
 
@@ -37,6 +38,7 @@ const COMMANDS = [
   ['/system', 'atur system prompt (/system reset)'],
   ['/tools', 'tool on/off (jalankan perintah, baca/tulis file)'],
   ['/mode', 'izin tool: ask | auto | readonly'],
+  ['/github', 'token GitHub (/github status | logout)'],
   ['/cwd', 'lihat / ganti folder kerja'],
   ['/compact', 'ringkas percakapan lama (opsional: /compact fokus)'],
   ['/usage', 'token terpakai & isi konteks'],
@@ -222,6 +224,7 @@ class App {
     this.opId = 0;
     this.restored = false;
     this.cwd = process.cwd();
+    this.noTools = new Set(); // provider/model yang menolak tool: lanjut tanpa tool selama sesi
     this.sessionAllow = new Set(); // tool yang diizinkan "selalu" selama sesi ini
     this.perm = null; // permintaan izin yang sedang menunggu jawaban
     this.usage = { input: 0, output: 0, requests: 0, estRequests: 0, last: null, compactions: 0, pruned: 0, retries: 0 };
@@ -519,6 +522,7 @@ class App {
   async finishForm(skipVerify) {
     const f = this.form;
     const p = f.p;
+    if (p.custom === 'github') return this.finishGithub(skipVerify);
     const stored = this.cfg.providers[p.id] || {};
     const conf = { ...stored, ...f.values };
     const token = ++this.opId;
@@ -878,7 +882,8 @@ class App {
           store.save(this.cfg);
           this.sys(this.cfg.tools ? `Tool aktif (mode ${this.cfg.mode}).` : 'Tool dimatikan: Elephant hanya mengobrol.');
         } else {
-          const list = tools.defsFor(this.cfg.mode).map((d) => `  ${d.name.padEnd(12)} ${d.risk === 'read' ? 'baca (otomatis)' : d.risk === 'exec' ? 'jalankan perintah' : d.risk === 'net' ? 'akses jaringan' : 'tulis file'}`);
+          const list = tools.defsFor(this.cfg.mode).map((d) => `  ${d.name.padEnd(16)} ${tools.riskLabel(d)}`);
+          if (!gh.hasToken()) list.push('  (tool GitHub muncul setelah token diset: /github)');
           this.sys([`Tool: ${this.cfg.tools !== false ? 'aktif' : 'mati'}  ${G.sep}  mode: ${this.cfg.mode}  ${G.sep}  folder: ${this.cwd}`, ...list, '/tools on | off  untuk mengganti'].join('\n'));
         }
         break;
@@ -899,6 +904,13 @@ class App {
         }
         break;
       }
+      case '/github': {
+        const v = arg.toLowerCase();
+        if (v === 'logout') { gh.clearToken(); this._sysTok = null; this.sys('Token GitHub dihapus.'); }
+        else if (v === 'status') this.githubStatus();
+        else this.openGithubForm('chat');
+        break;
+      }
       case '/cwd': {
         if (!arg) { this.sys('Folder kerja: ' + this.cwd); break; }
         const target = require('path').resolve(this.cwd, arg.replace(/^~(?=$|[\\/])/, require('os').homedir()));
@@ -914,6 +926,53 @@ class App {
       case '/exit': case '/quit': this.quit(0); break;
       default: this.sys(`Perintah tidak dikenal: ${cmd}. Ketik /help.`);
     }
+  }
+
+  async githubStatus() {
+    if (!gh.hasToken()) return this.sys('GitHub: belum ada token. Ketik /github untuk menambahkan.');
+    this.setFlash('Mengecek token GitHub…', 'warn', 15000);
+    let r;
+    try { r = await gh.execute('gh_whoami', {}, {}); } catch (e) { r = { isError: true, content: e.message }; }
+    this.flash = null;
+    return this.sys('GitHub:\n' + r.content.replace(/^Error: /, ''));
+  }
+
+  // Form token GitHub: memakai layar form yang sama dengan API key.
+  openGithubForm(back) {
+    const has = gh.hasToken();
+    const p = { id: '__github', name: 'GitHub (Personal Access Token)', host: 'api.github.com', keyUrl: 'https://github.com/settings/tokens', custom: 'github' };
+    const fields = [{ id: 'apiKey', label: 'GitHub token', secret: true, def: '', required: !has, hasStored: has, hint: 'butuh izin repo (classic) / Contents+Pull requests+Issues (fine-grained)' }];
+    this.form = { p, fields, idx: 0, values: {}, error: '', loading: false, canSkip: false, back, field: new Field('') };
+    this.screen = 'form';
+    this.draw();
+  }
+
+  async finishGithub(skipVerify) {
+    const f = this.form;
+    const v = f.values.apiKey;
+    if (!v) { this.screen = 'chat'; this.sys('Token GitHub tidak diubah.'); return this.draw(); }
+    const id = ++this.opId;
+    const prev = gh.getToken();
+    gh.setToken(v.replace(/\s+/g, ''));
+    this._sysTok = null;
+    if (skipVerify) { this.screen = 'chat'; this.sys('Token GitHub disimpan (belum diverifikasi).'); return this.draw(); }
+    f.loading = true;
+    f.error = '';
+    this.spin(true);
+    this.draw();
+    let r;
+    try { r = await gh.execute('gh_whoami', {}, {}); } catch (e) { r = { isError: true, content: e.message }; }
+    if (id !== this.opId) return undefined;
+    this.spin(false);
+    f.loading = false;
+    if (r.isError) {
+      if (/ditolak/.test(r.content)) { if (prev) gh.setToken(prev); else gh.clearToken(); this._sysTok = null; f.error = r.content.replace(/^Error: /, '').split('. ')[0] + '.'; f.canSkip = false; }
+      else { f.error = r.content.replace(/^Error: /, '') + ' (Tab: simpan tetap)'; f.canSkip = true; }
+      return this.draw();
+    }
+    this.screen = 'chat';
+    this.sys('GitHub terhubung.\n' + r.content + '\nTool gh_* sekarang aktif. Contoh: "buat issue di repo X", "baca README repo Y".');
+    return this.draw();
   }
 
   async pickModel() {
@@ -938,7 +997,8 @@ class App {
 
   buildSystem() {
     const base = this.cfg.system || '';
-    if (this.cfg.tools === false) return base;
+    const a = this.cfg.active;
+    if (this.cfg.tools === false || (a && this.noTools.has(`${a.provider}/${a.model}`))) return base;
     return base + '\n\n' + tools.agentPrompt(this.cwd, this.cfg.mode);
   }
 
@@ -949,7 +1009,7 @@ class App {
 
   // ------------------------------------------------------------ konteks & usage
   ctxWindow() {
-    return context.windowFor(this.cfg.active && this.cfg.active.model, this.cfg.window);
+    return context.windowFor(this.cfg.active && this.cfg.active.model, this.cfg.window, this.cfg.active && this.cfg.active.provider);
   }
 
   ctxThreshold() {
@@ -1139,11 +1199,12 @@ class App {
     const a = this.cfg.active;
     const p = getProvider(a.provider);
     const conf = this.cfg.providers[p.id] || {};
-    const useTools = this.cfg.tools !== false;
+    const modelKey = `${a.provider}/${a.model}`;
     const signal = this.ctrl.signal;
     let ctxRecovered = false; // sekali per pesan: kalau server bilang konteks kepenuhan, ringkas paksa lalu ulangi
 
     for (let step = 0; step < MAX_STEPS; step++) {
+      const useTools = this.cfg.tools !== false && !this.noTools.has(modelKey);
       try {
         await this.ensureContext(signal);
       } catch (e) {
@@ -1172,6 +1233,15 @@ class App {
         this.retryInfo = null;
         if (e && e.name === 'AbortError') reply.stopped = true;
         else {
+          if (useTools && e.noTools) {
+            // Model (mis. Ollama lokal tertentu) tidak mendukung tool: lanjut sebagai chat biasa.
+            this.noTools.add(modelKey);
+            this._sysTok = null;
+            this.messages.splice(this.messages.indexOf(reply), 1);
+            this.sys(`Model ${a.model} tidak mendukung tool, jadi lanjut sebagai chat biasa (tanpa jalankan perintah/baca file). Pilih model lain (/model) kalau butuh tool.`);
+            step--;
+            continue;
+          }
           const tooBig = (e.status === 400 || e.status === 413) && /context|too many tokens|token limit|maximum.*length|too large|prompt is too long|reduce the length/i.test(e.message);
           if (tooBig && !ctxRecovered && !reply.content) {
             ctxRecovered = true;
@@ -1231,9 +1301,9 @@ class App {
     const def = tools.getDef(tm.name);
     if (!def) return fail(`Error: tool tidak dikenal: ${tm.name}`);
     if (tm.argError) return fail(`Error: ${tm.argError}. Kirim ulang tool call dengan argumen JSON yang valid.`);
-    if (this.cfg.mode === 'readonly' && def.risk !== 'read') return fail('Ditolak: mode readonly, hanya boleh membaca. Jelaskan perubahan yang diperlukan kepada pengguna.');
+    if (this.cfg.mode === 'readonly' && tools.riskOf(def, tm.args) !== 'read') return fail('Ditolak: mode readonly, hanya boleh membaca. Jelaskan perubahan yang diperlukan kepada pengguna.');
 
-    const danger = tm.name === 'run_command' && tools.isDangerous(tm.args.command);
+    const danger = tools.isDangerousCall(tm.name, tm.args);
     if (tools.needsApproval(def, tm.args, this.cfg.mode, this.sessionAllow)) {
       const ans = await this.askPerm(tm, danger);
       if (ans === 'no') {
@@ -1247,7 +1317,7 @@ class App {
     const allowHosts = new Set(); // host private yang disetujui pengguna, hanya untuk panggilan ini
     for (let round = 0; round < 4; round++) {
       try {
-        r = await tools.execute(tm.name, tm.args, { cwd: this.cwd, signal, allowHosts });
+        r = await tools.execute(tm.name, tm.args, { cwd: this.cwd, signal, allowHosts, onWait: (w) => { this.sys(`GitHub: ${w.reason}, menunggu ${gh.fmtWait(w.waitMs)} lalu lanjut otomatis.`); } });
       } catch (e) {
         r = { content: 'Error: ' + ((e && e.message) || e), isError: true };
       }

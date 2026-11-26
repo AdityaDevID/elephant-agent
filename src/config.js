@@ -37,8 +37,14 @@ function save(cfg) {
   fs.renameSync(tmp, file());
 }
 
-function reset() {
-  try { fs.unlinkSync(file()); } catch { /* sudah tidak ada */ }
+// Token GitHub disimpan di file terpisah supaya simpan config dari UI tidak menimpanya.
+function githubFile() {
+  return path.join(dir(), 'github.json');
 }
 
-module.exports = { load, save, reset, file, dir, DEFAULT_SYSTEM };
+function reset() {
+  try { fs.unlinkSync(file()); } catch { /* sudah tidak ada */ }
+  try { fs.unlinkSync(githubFile()); } catch { /* sudah tidak ada */ }
+}
+
+module.exports = { load, save, reset, file, dir, githubFile, DEFAULT_SYSTEM };

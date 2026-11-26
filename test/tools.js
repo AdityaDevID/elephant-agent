@@ -9,6 +9,7 @@ const assert = require('assert');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'elephant-test-'));
 process.env.ELEPHANT_HOME = path.join(tmp, 'home');
+for (const k of ['GITHUB_TOKEN', 'GH_TOKEN', 'ELEPHANT_GITHUB_TOKEN']) delete process.env[k]; // runner CI men-set GH_TOKEN
 const work = path.join(tmp, 'work');
 fs.mkdirSync(work);
 

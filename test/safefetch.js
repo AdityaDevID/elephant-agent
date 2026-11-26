@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
 const assert = require('assert');
+for (const k of ['GITHUB_TOKEN', 'GH_TOKEN', 'ELEPHANT_GITHUB_TOKEN']) delete process.env[k]; // runner CI men-set GH_TOKEN
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'elephant-ssrf-'));
 process.env.ELEPHANT_HOME = path.join(tmp, 'home');

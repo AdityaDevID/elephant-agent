@@ -3,6 +3,7 @@
 // Smoke test tanpa dependency: lapisan API (list model + streaming) vs server mock, plus helper teks.
 const http = require('http');
 const assert = require('assert');
+for (const k of ['GITHUB_TOKEN', 'GH_TOKEN', 'ELEPHANT_GITHUB_TOKEN']) delete process.env[k]; // runner CI men-set GH_TOKEN
 const A = require('../src/ansi');
 const api = require('../src/api');
 const { filterItems, md } = require('../src/ui');

@@ -11,8 +11,7 @@ const assert = require('assert');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'elephant-daemon-'));
 process.env.ELEPHANT_HOME = path.join(tmp, 'home');
 process.env.ELEPHANT_DAEMON_QUIET = '1';
-delete process.env.GITHUB_TOKEN;
-delete process.env.GH_TOKEN;
+for (const k of ['GITHUB_TOKEN', 'GH_TOKEN', 'ELEPHANT_GITHUB_TOKEN']) delete process.env[k]; // runner CI men-set GH_TOKEN
 const work = path.join(tmp, 'work');
 fs.mkdirSync(work);
 
